@@ -229,6 +229,11 @@
   .sync-status.ok{ color:var(--green); border-color:var(--green); }
   .sync-status.err{ color:var(--red); border-color:var(--red); }
   .sync-status.idle{ color:var(--text-dim); }
+  .reminder-item{ display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom:1px solid var(--line); }
+  .reminder-item:last-child{ border-bottom:none; }
+  .reminder-item .time{ font-family:var(--mono); font-size:15px; }
+  .reminder-item .rm{ cursor:pointer; color:var(--text-faint); font-size:14px; padding:2px 8px; }
+  .reminder-item .rm:hover{ color:var(--red); }
 
   nav.tabbar{
     position:fixed; bottom:0; left:0; right:0; z-index:30;
@@ -485,6 +490,23 @@
     <button class="btn block" onclick="syncGarminNow()">Sincronizar agora</button>
     <div class="sync-status idle" id="sync-status">Ainda não sincronizado.</div>
 
+    <div class="field-lbl">Lembretes de hábitos</div>
+    <div class="note">
+      As notificações só chegam enquanto o browser/app estiver aberto ou em segundo plano no telemóvel — se fechares mesmo o browser (ou no iPhone, se saíres da app), não disparam. Para notificações garantidas com a app totalmente fechada é preciso um servidor de push, que é um passo à parte.
+    </div>
+    <div class="switch-row">
+      <div>
+        <div class="lbl-main">Ativar notificações</div>
+        <div class="lbl-sub" id="notif-permission-status">Permissão: por pedir</div>
+      </div>
+      <div class="switch" id="notif-switch" onclick="toggleNotifications()"><div class="knob"></div></div>
+    </div>
+    <div id="reminder-list"></div>
+    <div class="add-form">
+      <input type="time" id="reminder-time-input" value="09:00">
+      <button class="btn" onclick="addReminderTime()">+</button>
+    </div>
+
     <div class="field-lbl">Importação manual (sempre funciona)</div>
     <div class="note" style="margin-top:0;">Cola aqui um JSON com os campos que tiveres, ex: <code>{"recovery":72,"hrv":55,"rhr":48,"sleepScore":81,"strain":9.2,"respRate":14,"sleepStages":{"deep":90,"light":210,"rem":75,"awake":15}}</code></div>
     <textarea id="manual-json" placeholder='{"recovery":72,"hrv":55,"rhr":48,"sleepScore":81,"strain":9.2}'></textarea>
@@ -504,10 +526,13 @@ function loadDB(){
     if(!raw) throw 0;
     const parsed = JSON.parse(raw);
     parsed.settings = parsed.settings || {};
+    if(parsed.settings.notifEnabled === undefined) parsed.settings.notifEnabled = false;
+    if(!parsed.settings.reminders) parsed.settings.reminders = [];
+    if(!parsed.settings.firedReminders) parsed.settings.firedReminders = {};
     parsed.recovery = parsed.recovery || {};
     return parsed;
   }catch(e){
-    return { habits:[], diary:[], goals:[], tasks:{}, recovery:{}, settings:{mcpUrl:'',mcpToken:'',mcpTool:'',autoSync:false,lastSync:null,lastSyncOk:null} };
+    return { habits:[], diary:[], goals:[], tasks:{}, recovery:{}, settings:{mcpUrl:'',mcpToken:'',mcpTool:'',autoSync:false,lastSync:null,lastSyncOk:null,notifEnabled:false,reminders:[],firedReminders:{}} };
   }
 }
 function saveDB(){ localStorage.setItem(DB_KEY, JSON.stringify(db)); }
@@ -902,6 +927,8 @@ function openSettings(){
   document.getElementById('set-mcp-tool').value = db.settings.mcpTool || '';
   document.getElementById('autosync-switch').classList.toggle('on', !!db.settings.autoSync);
   updateSyncStatusUI();
+  updateNotifUI();
+  renderReminders();
   document.getElementById('settings-overlay').classList.add('open');
 }
 function closeSettings(){
@@ -1004,6 +1031,96 @@ function importManualJSON(){
     alert('JSON inválido. Verifica o formato e tenta novamente.');
   }
 }
+/* ---------------- NOTIFICAÇÕES / LEMBRETES ---------------- */
+function notifPermissionLabel(){
+  if(!('Notification' in window)) return 'não suportado neste browser';
+  if(Notification.permission === 'granted') return 'permissão concedida';
+  if(Notification.permission === 'denied') return 'bloqueada — ativa nas definições do browser/telemóvel';
+  return 'por pedir';
+}
+function updateNotifUI(){
+  document.getElementById('notif-permission-status').textContent = 'Permissão: ' + notifPermissionLabel();
+  document.getElementById('notif-switch').classList.toggle('on', !!db.settings.notifEnabled && Notification.permission === 'granted');
+}
+async function toggleNotifications(){
+  if(!('Notification' in window)){ alert('Este browser não suporta notificações.'); return; }
+  if(!db.settings.notifEnabled){
+    const perm = await Notification.requestPermission();
+    if(perm !== 'granted'){ updateNotifUI(); return; }
+    db.settings.notifEnabled = true;
+  } else {
+    db.settings.notifEnabled = false;
+  }
+  saveDB(); updateNotifUI();
+}
+function renderReminders(){
+  const wrap = document.getElementById('reminder-list');
+  const list = db.settings.reminders || [];
+  wrap.innerHTML = '';
+  if(list.length === 0){
+    wrap.innerHTML = '<div class="empty" style="padding:12px 0;">Sem horários definidos.</div>';
+    return;
+  }
+  list.forEach((time, i)=>{
+    const row = document.createElement('div');
+    row.className = 'reminder-item';
+    row.innerHTML = `<div class="time">${time}</div><div class="rm" data-i="${i}">✕</div>`;
+    wrap.appendChild(row);
+  });
+  wrap.querySelectorAll('.rm').forEach(rm=>{
+    rm.addEventListener('click', ()=>{
+      list.splice(rm.dataset.i, 1);
+      saveDB(); renderReminders();
+    });
+  });
+}
+function addReminderTime(){
+  const inp = document.getElementById('reminder-time-input');
+  if(!inp.value) return;
+  db.settings.reminders = db.settings.reminders || [];
+  if(!db.settings.reminders.includes(inp.value)) db.settings.reminders.push(inp.value);
+  db.settings.reminders.sort();
+  saveDB(); renderReminders();
+}
+function fireHabitReminder(){
+  const doneToday = db.habits.filter(h => h.log && h.log[todayStr()]).length;
+  const totalHabits = db.habits.length;
+  if(totalHabits === 0) return;
+  const pending = totalHabits - doneToday;
+  const title = pending > 0 ? 'Evolution OS — hábitos por fazer' : 'Evolution OS — dia completo';
+  const body = pending > 0
+    ? `Ainda tens ${pending} de ${totalHabits} hábitos por fazer hoje.`
+    : `Todos os ${totalHabits} hábitos concluídos. Bom trabalho.`;
+  try{
+    if(navigator.serviceWorker && navigator.serviceWorker.controller){
+      navigator.serviceWorker.ready.then(reg => reg.showNotification(title, {body, icon: undefined}));
+    } else {
+      new Notification(title, {body});
+    }
+  }catch(e){ /* browser recusou disparo direto — ignora silenciosamente */ }
+}
+function checkReminders(){
+  if(!db.settings.notifEnabled || Notification.permission !== 'granted') return;
+  const list = db.settings.reminders || [];
+  if(list.length === 0) return;
+  const now = new Date();
+  const hhmm = now.toTimeString().slice(0,5);
+  const key = todayStr() + '_' + hhmm;
+  db.settings.firedReminders = db.settings.firedReminders || {};
+  // limpa registos de dias anteriores
+  Object.keys(db.settings.firedReminders).forEach(k=>{ if(!k.startsWith(todayStr())) delete db.settings.firedReminders[k]; });
+  if(list.includes(hhmm) && !db.settings.firedReminders[key]){
+    db.settings.firedReminders[key] = true;
+    saveDB();
+    fireHabitReminder();
+  }
+}
+let reminderTimer = null;
+function setupReminderLoop(){
+  if(reminderTimer) clearInterval(reminderTimer);
+  reminderTimer = setInterval(checkReminders, 20*1000);
+}
+
 let autosyncTimer = null;
 function setupAutosyncLoop(){
   if(autosyncTimer) clearInterval(autosyncTimer);
@@ -1032,6 +1149,7 @@ function init(){
   renderDiary();
   renderGoals();
   setupAutosyncLoop();
+  setupReminderLoop();
   saveDB();
 }
 init();
